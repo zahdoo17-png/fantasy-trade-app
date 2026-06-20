@@ -1,12 +1,12 @@
 // pages/api/cron/sync-stats.js
-// Nightly NBA stats sync using official NBA stats API (no key needed)
+// Nightly NBA stats sync using balldontlie.io
 
 import { getAdminClient } from '../../../lib/supabase'
 import {
-  getAllPlayersWithStats,
-  getPlayerGameLogs,
+  getAllPlayers,
+  getSeasonAverages,
+  getRecentGamesWithStats,
   currentSeason,
-  currentSeasonYear,
   sleep
 } from '../../../lib/nba-api'
 import {
@@ -27,7 +27,6 @@ export default async function handler(req, res) {
 
   const db = getAdminClient()
   const season = currentSeason()
-  const seasonYear = currentSeasonYear()
   const startedAt = new Date().toISOString()
 
   const { data: syncEntry } = await db
@@ -41,35 +40,27 @@ export default async function handler(req, res) {
   let gameLogsAdded = 0
 
   try {
-    console.log(`[SYNC] Starting sync for ${season}...`)
+    console.log(`[SYNC] Starting sync for ${season} season...`)
 
-    const allStats = await getAllPlayersWithStats(season)
-    console.log(`[SYNC] Got ${allStats.length} players from NBA API`)
+    const players = await getAllPlayers()
+    console.log(`[SYNC] Got ${players.length} active players`)
 
-    if (!allStats.length) {
-      throw new Error('No player data returned from NBA API')
+    if (!players.length) {
+      throw new Error('No players returned from balldontlie API')
     }
 
-    const prevSeason1 = `${seasonYear - 1}-${String(seasonYear).slice(2)}`
-    const prevSeason2 = `${seasonYear - 2}-${String(seasonYear - 1).slice(2)}`
-
-    const [prev1Stats, prev2Stats] = await Promise.all([
-      getAllPlayersWithStats(prevSeason1),
-      getAllPlayersWithStats(prevSeason2),
-    ])
-
-    const prevGP1 = Object.fromEntries(prev1Stats.map(s => [s.player_id, s.gp || 0]))
-    const prevGP2 = Object.fromEntries(prev2Stats.map(s => [s.player_id, s.gp || 0]))
-
-    const playerRows = allStats.map(s => ({
-      id: parseInt(s.player_id),
-      full_name: s.player_name,
-      first_name: s.player_name?.split(' ')[0] || '',
-      last_name: s.player_name?.split(' ').slice(1).join(' ') || '',
-      team_abbreviation: s.team_abbreviation || 'FA',
-      team_name: s.team_abbreviation || 'FA',
-      position: s.player_position || 'N/A',
-      age: parseInt(s.age) || 25,
+    const playerRows = players.map(p => ({
+      id: p.id,
+      full_name: `${p.first_name} ${p.last_name}`,
+      first_name: p.first_name,
+      last_name: p.last_name,
+      team_id: p.team?.id || null,
+      team_abbreviation: p.team?.abbreviation || 'FA',
+      team_name: p.team?.full_name || 'Free Agent',
+      position: p.position || 'N/A',
+      height: p.height || null,
+      weight: p.weight || null,
+      jersey_number: p.jersey_number || null,
       is_active: true,
       updated_at: new Date().toISOString()
     }))
@@ -79,27 +70,36 @@ export default async function handler(req, res) {
     }
     console.log(`[SYNC] Upserted ${playerRows.length} players`)
 
-    const statsRows = allStats
-      .filter(s => parseInt(s.gp) > 0)
+    const playerIds = players.map(p => p.id)
+    const seasonAvgs = await getSeasonAverages(playerIds, season)
+    console.log(`[SYNC] Got averages for ${seasonAvgs.length} players`)
+
+    const prevSeason1 = season - 1
+    const prevSeason2 = season - 2
+    const [prevAvgs1, prevAvgs2] = await Promise.all([
+      getSeasonAverages(playerIds.slice(0, 200), prevSeason1),
+      getSeasonAverages(playerIds.slice(0, 200), prevSeason2)
+    ])
+
+    const prevGPMap1 = Object.fromEntries(prevAvgs1.map(s => [s.player_id, s.games_played]))
+    const prevGPMap2 = Object.fromEntries(prevAvgs2.map(s => [s.player_id, s.games_played]))
+    const playerAgeMap = Object.fromEntries(players.map(p => [p.id, p.age || 25]))
+
+    const statsRows = seasonAvgs
+      .filter(s => s.games_played > 0)
       .map(s => {
-        const playerId = parseInt(s.player_id)
-        const age = parseInt(s.age) || 25
-        const gpCur = parseInt(s.gp) || 0
-        const gpY1 = prevGP1[s.player_id] || 0
-        const gpY2 = prevGP2[s.player_id] || 0
+        const age = playerAgeMap[s.player_id] || 25
+        const gpCur = s.games_played || 0
+        const gpY1 = prevGPMap1[s.player_id] || 0
+        const gpY2 = prevGPMap2[s.player_id] || 0
 
         const statLine = {
-          fgm: parseFloat(s.fgm) || 0,
-          fga: parseFloat(s.fga) || 0,
-          ftm: parseFloat(s.ftm) || 0,
-          fta: parseFloat(s.fta) || 0,
-          fg3m: parseFloat(s.fg3m) || 0,
-          reb: parseFloat(s.reb) || 0,
-          ast: parseFloat(s.ast) || 0,
-          stl: parseFloat(s.stl) || 0,
-          blk: parseFloat(s.blk) || 0,
-          to: parseFloat(s.tov) || 0,
-          pts: parseFloat(s.pts) || 0,
+          fgm: s.fgm || 0, fga: s.fga || 0,
+          ftm: s.ftm || 0, fta: s.fta || 0,
+          fg3m: s.fg3m || 0,
+          reb: s.reb || 0, ast: s.ast || 0,
+          stl: s.stl || 0, blk: s.blk || 0,
+          to: s.turnover || 0, pts: s.pts || 0
         }
 
         const fpg = parseFloat(calcFantasyPPG(statLine).toFixed(2))
@@ -109,24 +109,24 @@ export default async function handler(req, res) {
         const projTotal = parseFloat((fpg * af * gf * gpCur).toFixed(1))
 
         return {
-          player_id: playerId,
-          season: seasonYear,
+          player_id: s.player_id,
+          season,
           games_played: gpCur,
-          pts_per_game: statLine.pts,
-          reb_per_game: statLine.reb,
-          ast_per_game: statLine.ast,
-          stl_per_game: statLine.stl,
-          blk_per_game: statLine.blk,
-          to_per_game: statLine.to,
-          fgm_per_game: statLine.fgm,
-          fga_per_game: statLine.fga,
-          fg_pct: parseFloat(s.fg_pct) || 0,
-          ftm_per_game: statLine.ftm,
-          fta_per_game: statLine.fta,
-          ft_pct: parseFloat(s.ft_pct) || 0,
-          fg3m_per_game: statLine.fg3m,
-          fg3a_per_game: parseFloat(s.fg3a) || 0,
-          min_per_game: parseFloat(s.min) || 0,
+          pts_per_game: s.pts || 0,
+          reb_per_game: s.reb || 0,
+          ast_per_game: s.ast || 0,
+          stl_per_game: s.stl || 0,
+          blk_per_game: s.blk || 0,
+          to_per_game: s.turnover || 0,
+          fgm_per_game: s.fgm || 0,
+          fga_per_game: s.fga || 0,
+          fg_pct: s.fg_pct || 0,
+          ftm_per_game: s.ftm || 0,
+          fta_per_game: s.fta || 0,
+          ft_pct: s.ft_pct || 0,
+          fg3m_per_game: s.fg3m || 0,
+          fg3a_per_game: s.fg3a || 0,
+          min_per_game: s.min ? parseFloat(s.min) : 0,
           fantasy_pts_per_game: fpg,
           proj_season_total: projTotal,
           injury_risk_score: risk,
@@ -144,60 +144,67 @@ export default async function handler(req, res) {
       })
     }
     playersUpdated = statsRows.length
-    console.log(`[SYNC] Updated ${playersUpdated} player stats`)
+    console.log(`[SYNC] Updated stats for ${playersUpdated} players`)
 
-    const top100 = statsRows
+    const topPlayers = statsRows
       .sort((a, b) => b.proj_season_total - a.proj_season_total)
-      .slice(0, 100)
+      .slice(0, 150)
 
-    for (const player of top100) {
+    for (const player of topPlayers) {
       try {
-        const logs = await getPlayerGameLogs(player.player_id, season)
-        if (!logs.length) continue
+        const recentGames = await getRecentGamesWithStats(player.player_id, season, 15)
+        if (!recentGames.length) continue
 
-        const logRows = logs.slice(0, 15).map(g => ({
-          player_id: player.player_id,
-          game_date: g.game_date ? g.game_date.substring(0, 10) : new Date().toISOString().substring(0, 10),
-          season: seasonYear,
-          team_abbreviation: g.team_abbreviation || '',
-          home_away: g.matchup?.includes('vs.') ? 'H' : 'A',
-          minutes: parseFloat(g.min) || 0,
-          pts: parseInt(g.pts) || 0,
-          reb: parseInt(g.reb) || 0,
-          ast: parseInt(g.ast) || 0,
-          stl: parseInt(g.stl) || 0,
-          blk: parseInt(g.blk) || 0,
-          turnover: parseInt(g.tov) || 0,
-          fgm: parseInt(g.fgm) || 0,
-          fga: parseInt(g.fga) || 0,
-          ftm: parseInt(g.ftm) || 0,
-          fta: parseInt(g.fta) || 0,
-          fg3m: parseInt(g.fg3m) || 0,
-          fg3a: parseInt(g.fg3a) || 0,
-          fantasy_pts: parseFloat(calcFantasyPPG({
-            fgm: parseInt(g.fgm) || 0, fga: parseInt(g.fga) || 0,
-            ftm: parseInt(g.ftm) || 0, fta: parseInt(g.fta) || 0,
-            fg3m: parseInt(g.fg3m) || 0, reb: parseInt(g.reb) || 0,
-            ast: parseInt(g.ast) || 0, stl: parseInt(g.stl) || 0,
-            blk: parseInt(g.blk) || 0, to: parseInt(g.tov) || 0,
-            pts: parseInt(g.pts) || 0,
-          }).toFixed(2))
-        }))
+        const logRows = recentGames
+          .filter(g => g.min && parseFloat(g.min) > 0)
+          .map(g => {
+            const statLine = {
+              fgm: g.fgm || 0, fga: g.fga || 0,
+              ftm: g.ftm || 0, fta: g.fta || 0,
+              fg3m: g.fg3m || 0, reb: g.reb || 0,
+              ast: g.ast || 0, stl: g.stl || 0,
+              blk: g.blk || 0, to: g.turnover || 0,
+              pts: g.pts || 0
+            }
+            const fp = parseFloat(calcFantasyPPG(statLine).toFixed(2))
+            const game = g.game || {}
+            const isHome = game.home_team_id === g.team?.id
+
+            return {
+              player_id: player.player_id,
+              game_id: g.game?.id || null,
+              game_date: game.date ? game.date.substring(0, 10) : new Date().toISOString().substring(0, 10),
+              season,
+              team_abbreviation: g.team?.abbreviation || '',
+              home_away: isHome ? 'H' : 'A',
+              minutes: g.min ? parseFloat(g.min) : 0,
+              pts: g.pts || 0,
+              reb: g.reb || 0,
+              ast: g.ast || 0,
+              stl: g.stl || 0,
+              blk: g.blk || 0,
+              turnover: g.turnover || 0,
+              fgm: g.fgm || 0,
+              fga: g.fga || 0,
+              ftm: g.ftm || 0,
+              fta: g.fta || 0,
+              fg3m: g.fg3m || 0,
+              fg3a: g.fg3a || 0,
+              fantasy_pts: fp
+            }
+          })
 
         if (logRows.length) {
-          await db.from('game_logs').upsert(logRows, {
-            onConflict: 'player_id,game_date',
-            ignoreDuplicates: true
-          })
+          await db.from('game_logs').upsert(logRows, { onConflict: 'player_id,game_date', ignoreDuplicates: true })
           gameLogsAdded += logRows.length
         }
-        await sleep(500)
+        await sleep(200)
       } catch (e) {
-        console.warn(`[SYNC] Game log error for ${player.player_id}:`, e.message)
+        console.warn(`[SYNC] Game log error for player ${player.player_id}:`, e.message)
       }
     }
 
-    console.log(`[SYNC] Added ${gameLogsAdded} game logs`)
+    console.log(`[SYNC] Added ${gameLogsAdded} game log entries`)
 
     await db.from('sync_log').update({
       finished_at: new Date().toISOString(),
@@ -206,6 +213,7 @@ export default async function handler(req, res) {
       status: 'success'
     }).eq('id', syncId)
 
+    console.log('[SYNC] Nightly sync complete!')
     return res.status(200).json({
       success: true,
       season,
@@ -215,12 +223,13 @@ export default async function handler(req, res) {
     })
 
   } catch (error) {
-    console.error('[SYNC] Error:', error)
+    console.error('[SYNC] Fatal error:', error)
     await db.from('sync_log').update({
       finished_at: new Date().toISOString(),
       status: 'error',
       error_message: error.message
     }).eq('id', syncId)
+
     return res.status(500).json({ error: error.message })
   }
 }
