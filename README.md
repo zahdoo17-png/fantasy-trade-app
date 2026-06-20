@@ -182,4 +182,4 @@ The player has 0 games in the DB — trigger a sync first.
 Edit `lib/fantasy.js` → `SCORING` object, then re-sync stats.
 
 **Can I add rookies manually?**
-Yes — insert them directly into Supabase's `players` and `season_stats` tables.
+Yes — insert them directly into Supabase's `players` and `season_stats` tables..
